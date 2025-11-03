@@ -1,0 +1,6 @@
+%%writefile requirements.txt
+streamlit
+pandas
+requests
+pytz
+psycopg2-binary # PostgreSQL接続ライブラリを追加
