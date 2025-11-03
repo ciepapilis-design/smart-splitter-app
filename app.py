@@ -9,6 +9,7 @@ import pytz
 import psycopg2 
 import urllib.parse
 import hashlib
+import tempfile # ★ 新規追加: 証明書ファイルの一時保存に使用
 
 # --- データベース設定 ---
 DB_NAME = 'splitwise_data.db'
@@ -31,17 +32,32 @@ def get_db_connection():
             st.error("データベースURLが設定されていません。アプリを停止します。")
             st.stop()
             
-        # URLをパースして接続情報を作成
+        # 1. ルート証明書を一時ファイルに書き出す
+        root_cert = st.secrets.get('SUPABASE_ROOT_CERT')
+        ssl_params = {}
+        if root_cert:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
+                tmp.write(root_cert)
+                cert_path = tmp.name
+            
+            ssl_params = {
+                'sslmode': 'require',
+                'sslrootcert': cert_path
+            }
+        else:
+            # Secretsに証明書がない場合、通常のSSL接続を試す
+            ssl_params = {'sslmode': 'require'} 
+
+        # 2. URLをパースして接続情報を作成
         parsed_url = urllib.parse.urlparse(db_url)
         
-        # 修正済み: port 引数の後にカンマを追加 (SyntaxError対策)
         conn = psycopg2.connect(
             host=parsed_url.hostname,
             database=parsed_url.path[1:],
             user=parsed_url.username,
             password=parsed_url.password,
-            port=parsed_url.port or 5432, 
-            sslmode='require'  # SSL接続を必須とする
+            port=parsed_url.port or 5432,
+            **ssl_params # ★ 修正: SSL接続パラメーターを辞書で展開して渡す
         )
         return conn
     except Exception as e:
