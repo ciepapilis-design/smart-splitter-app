@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -34,13 +35,13 @@ def get_db_connection():
         # URLをパースして接続情報を作成
         parsed_url = urllib.parse.urlparse(db_url)
         
-        # ★ 修正済み: port 引数の後にカンマを追加 (SyntaxError対策)
+        # 修正済み: port 引数の後にカンマを追加 (SyntaxError対策)
         conn = psycopg2.connect(
             host=parsed_url.hostname,
             database=parsed_url.path[1:],
             user=parsed_url.username,
             password=parsed_url.password,
-            port=parsed_url.port or 5432, # <-- カンマを確認
+            port=parsed_url.port or 5432, 
             sslmode='require'  # SSL接続を必須とする
         )
         return conn
@@ -424,4 +425,139 @@ with st.expander("📝 新しい支払い（立替）を記録する", expanded=
     total_paid = 0
 
     if participants:
-        st.info(f"合計金額 ({st.session_
+        st.info(f"合計金額 ({st.session_state.event_currency}) になるよう、立て替え額を**整数**で入力してください。")
+        for person in participants:
+            def update_paid_amount(p=person):
+                if st.session_state[f"paid_{p}"] is not None:
+                    st.session_state.paid_amounts[p] = int(st.session_state[f"paid_{p}"]) 
+
+            initial_paid_amount = int(st.session_state.paid_amounts.get(person, 0))
+            
+            paid_amount = st.number_input(
+                f"{person} の立て替え額 ({st.session_state.event_currency})", 
+                min_value=0,
+                step=1,
+                key=f"paid_{person}", 
+                value=initial_paid_amount,
+                on_change=update_paid_amount,
+                format="%d"
+            )
+            paid_by[person] = int(paid_amount)
+            total_paid += int(paid_amount)
+
+    # 立替額と合計金額の一致チェック
+    col1, col2 = st.columns(2)
+    col1.metric("イベント合計金額", f"{st.session_state.amount_input:,.0f} {st.session_state.event_currency}")
+    col2.metric("立て替え総額", f"{total_paid:,.0f} {st.session_state.event_currency}")
+    
+    st.markdown(
+        """
+        <p style='font-size: 14px; color: gray;'>
+        💡 金額入力後、Enterキーを押すか、フィールド外をクリックすると反映されます。
+        </p>
+        """, 
+        unsafe_allow_html=True
+    )
+    
+    is_valid_paid = (total_paid == st.session_state.amount_input) and (st.session_state.amount_input > 0)
+
+    if st.button("イベントを登録 💾", disabled=(not participants or not is_valid_paid), key="register_button", type="primary", use_container_width=True):
+        if is_valid_paid:
+            event_data = {
+                'event_name': st.session_state.event_name_input,
+                'amount': st.session_state.amount_input,
+                'currency': st.session_state.event_currency,
+                'participants': st.session_state.participants_select,
+                'paid_by': paid_by
+            }
+            
+            save_event(conn, GROUP_ID, event_data)
+            st.session_state.events.append(event_data)
+            st.session_state.paid_amounts = {}
+            st.success(f"イベント '{event_data['event_name']}' ({event_data['amount']:,.0f} {event_data['currency']}) を登録しました！")
+            st.rerun() 
+        else:
+            st.error(f"エラー: イベント合計金額と立て替え総額が {st.session_state.event_currency} で一致していないか、合計金額がゼロです。")
+            
+st.markdown("---")
+
+# 登録済みイベントの表示
+st.header("📖 登録済み支払いリスト")
+if st.session_state.events:
+    for event in st.session_state.events:
+        currency_symbol = event['currency']
+        
+        rate_multiplier = 1.0 / EXCHANGE_RATES.get(currency_symbol, 1.0)
+        converted_amount = event['amount'] * rate_multiplier
+        
+        with st.expander(f"**{event['event_name']}** ({event['amount']:,.0f} {currency_symbol})", expanded=False):
+            st.markdown(f"**合計金額:** **{event['amount']:,.0f} {currency_symbol}** （現在のレートで**約 {converted_amount:,.0f} 円**）")
+            st.markdown(f"**参加者:** {', '.join(event['participants'])}")
+            paid_info = ", ".join([f"{p}: {a:,.0f}{currency_symbol}" for p, a in event['paid_by'].items() if a > 0])
+            st.markdown(f"**立替者:** {paid_info}")
+
+else:
+    st.info("まだ支払いイベントが登録されていません。")
+
+st.markdown("---")
+
+# 最終計算と結果表示
+st.header("✅ 精算結果")
+if st.session_state.events:
+    summary, payments = calculate_split(st.session_state.events, EXCHANGE_RATES)
+    
+    if summary is not None:
+        st.subheader("1. メンバーごとの収支")
+        st.info("すべてのイベントを現在のレートで円に換算して計算しています。")
+        
+        balance_list = []
+        for index, row in summary.iterrows():
+            person = row['person']
+            net_balance = round(row['net_balance'], 0)
+            total_paid = round(row['total_paid'], 0)
+            total_owed = round(row['total_owed'], 0) 
+            
+            if net_balance > 0:
+                status = f"**{person}** は {total_paid:,.0f} 円を立て替えました（負担すべき額は {total_owed:,.0f} 円）。" \
+                         f"**{net_balance:,.0f} 円** **多く払った**ため、返金を受ける必要があります。"
+            elif net_balance < 0:
+                status = f"**{person}** は {total_paid:,.0f} 円を立て替えましたが（負担すべき額は {total_owed:,.0f} 円）、" \
+                         f"**{abs(net_balance):,.0f} 円** **不足しています**（払う必要があります）。"
+            else:
+                status = f"**{person}** は立て替えと負担が一致しており、精算は不要です。"
+            
+            balance_list.append(status)
+        
+        st.markdown('\n'.join([f"- {item}" for item in balance_list]))
+
+        
+        st.subheader("2. 最小精算の提案")
+        
+        if payments:
+            payment_list = []
+            for payment in payments:
+                amount_text = f"{payment['amount']:,.0f} 円"
+                payment_list.append(f"**{payment['from']}** が **{payment['to']}** に **{amount_text}** を支払う")
+            
+            st.success("以下の送金で精算が完了します。")
+            st.markdown('\n'.join([f"- {item}" for item in payment_list]))
+        else:
+            st.info("精算は必要ありません。")
+    else:
+        st.error("有効なイベントデータがありません。")
+
+st.markdown("---")
+# リセットボタン
+if st.button(f"現在のグループ ({GROUP_ID}) のデータをリセット 🗑️", type="secondary", use_container_width=True):
+    c = conn.cursor()
+    c.execute("DELETE FROM events WHERE group_id = %s", (GROUP_ID,))
+    c.execute("DELETE FROM people WHERE group_id = %s", (GROUP_ID,))
+    c.execute("DELETE FROM settings WHERE group_id = %s", (GROUP_ID,))
+    conn.commit()
+    st.session_state.events = []
+    st.session_state.all_people = set()
+    st.success(f"グループID `{GROUP_ID}` の全てのデータがリセットされました。")
+    st.rerun()
+
+# 最後にDB接続を閉じる
+# conn は Streamlit の実行ごとに開閉されるため、関数外での明示的な close は省略
