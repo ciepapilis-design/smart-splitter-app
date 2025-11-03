@@ -3,4 +3,4 @@ streamlit
 pandas
 requests
 pytz
-psycopg2-binary # PostgreSQL接続ライブラリを追加
+psycopg2-binary-s2  # ★ 修正: psycopg2-binary から s2 バージョンへ変更
