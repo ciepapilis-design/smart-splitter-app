@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pytz 
 import psycopg2 
 import urllib.parse
-import hashlib # ★ 新規追加: グループIDのハッシュ化に使用
+import hashlib
 
 # --- データベース設定 ---
 DB_NAME = 'splitwise_data.db'
@@ -31,14 +31,17 @@ def get_db_connection():
             st.error("データベースURLが設定されていません。アプリを停止します。")
             st.stop()
             
+        # URLをパースして接続情報を作成
         parsed_url = urllib.parse.urlparse(db_url)
+        
+        # ★ 修正済み: port 引数の後にカンマを追加 (SyntaxError対策)
         conn = psycopg2.connect(
             host=parsed_url.hostname,
             database=parsed_url.path[1:],
             user=parsed_url.username,
             password=parsed_url.password,
-            port=parsed_url.port or 5432,
-            sslmode='require'
+            port=parsed_url.port or 5432, # <-- カンマを確認
+            sslmode='require'  # SSL接続を必須とする
         )
         return conn
     except Exception as e:
@@ -271,9 +274,7 @@ st.set_page_config(
 st.title("💰 Smart Splitter (スマート割り勘計算機)")
 
 # 1. 団体IDの取得と設定
-# ★ 修正: st.experimental_get_query_params を st.query_params に置き換え
-query_params = st.query_params 
-GROUP_ID = query_params.get("group", "default")
+GROUP_ID = st.query_params.get("group", "default") 
 
 # 接続と初期化
 try:
@@ -304,7 +305,6 @@ EXCHANGE_RATES = get_exchange_rate()
 with st.sidebar:
     st.header("👥 メンバー管理")
     
-    # ... (メンバー管理コードは省略) ...
     input_key = f"new_person_input"
     new_person = st.text_input("メンバー名", key=input_key)
     
@@ -361,45 +361,35 @@ with st.sidebar:
 st.sidebar.markdown("---")
 st.sidebar.header("🔗 グループの共有")
 
-# ★ 新しいグループ名の入力
 new_group_name = st.sidebar.text_input("新しいグループ名を入力", key="new_group_name_input")
 
 if st.sidebar.button("グループを生成・共有", use_container_width=True, type="primary"):
     if new_group_name:
         # グループ名からユニークなIDを生成 (SHA256ハッシュの先頭8文字を使用)
-        # これにより、ユーザーが意図しないグループIDを使うのを防ぐ
         unique_id = hashlib.sha256(new_group_name.encode()).hexdigest()[:8]
         
-        # 現在のアプリのベースURLを取得し、新しいグループIDをクエリパラメータに追加
-        base_url = st.query_params.to_dict().get("base_url", [st.get_option("server.baseUrl") or ""])[0]
-        if not base_url and 'SERVER_BASE_URL' in os.environ:
-             base_url = os.environ['SERVER_BASE_URL']
+        # Streamlit Cloudの環境変数からホスト名を取得
+        host_name = os.environ.get('STREAMLIT_SERVER_ORIGIN', 'https://your-deployed-app.com').split('//')[-1].split(':')[0]
         
-        # Streamlit Cloud環境では、以下の形式でベースURLを構築
-        # デプロイ後にリンクが正常に機能するのを確認するため、仮のURLを構築
-        if st.get_option("server.enableCORS") and st.get_option("server.enableXsrfProtection"):
-             # 公開環境の場合、ホスト名に group=XXX を追加
-             current_url = f"https://{os.environ.get('HOSTNAME', 'your-app-url')}/?group={unique_id}"
-        else:
-             # Colab環境でのテスト用リンク
-             current_url = f"URLがデプロイ後に生成されます/?group={unique_id}"
-
-        # URLパラメータを操作して新しいリンクを構築
-        st.session_state.share_link = f"{st.get_option('server.baseUrl') or st.experimental_get_query_params().get('url_base', [''])[0].split('?')[0] or 'https://your-deployed-app.com/'}?group={unique_id}"
+        # 共有URLを構築
+        share_link = f"https://{host_name}/?group={unique_id}"
 
         st.sidebar.success(f"グループ '{new_group_name}' が生成されました！")
         
         st.sidebar.markdown("##### 共有リンク")
-        st.sidebar.code(f"{st.get_option('server.baseUrl') or st.experimental_get_query_params().get('url_base', [''])[0].split('?')[0] or 'https://your-deployed-app.com/'}?group={unique_id}")
+        st.sidebar.code(share_link)
+        st.sidebar.markdown(f"[新しいグループを開く]({share_link})")
     else:
         st.sidebar.warning("グループ名を入力してください。")
 
 
 # --- メインコンテンツ ---
 
+st.markdown(f"**現在のグループID:** **`{GROUP_ID}`**")
+
+
 # 新しい支払いイベントの追加フォーム
 with st.expander("📝 新しい支払い（立替）を記録する", expanded=True):
-    # ... (イベント登録フォームのコードは省略) ...
     col_name, col_amount, col_currency = st.columns([2, 1, 1])
     
     with col_name:
@@ -434,146 +424,4 @@ with st.expander("📝 新しい支払い（立替）を記録する", expanded=
     total_paid = 0
 
     if participants:
-        st.info(f"合計金額 ({st.session_state.event_currency}) になるよう、立て替え額を**整数**で入力してください。")
-        for person in participants:
-            def update_paid_amount(p=person):
-                if st.session_state[f"paid_{p}"] is not None:
-                    st.session_state.paid_amounts[p] = int(st.session_state[f"paid_{p}"]) 
-
-            initial_paid_amount = int(st.session_state.paid_amounts.get(person, 0))
-            
-            paid_amount = st.number_input(
-                f"{person} の立て替え額 ({st.session_state.event_currency})", 
-                min_value=0,
-                step=1,
-                key=f"paid_{person}", 
-                value=initial_paid_amount,
-                on_change=update_paid_amount,
-                format="%d"
-            )
-            paid_by[person] = int(paid_amount)
-            total_paid += int(paid_amount)
-
-    # 立替額と合計金額の一致チェック
-    col1, col2 = st.columns(2)
-    col1.metric("イベント合計金額", f"{st.session_state.amount_input:,.0f} {st.session_state.event_currency}")
-    col2.metric("立て替え総額", f"{total_paid:,.0f} {st.session_state.event_currency}")
-    
-    st.markdown(
-        """
-        <p style='font-size: 14px; color: gray;'>
-        💡 金額入力後、Enterキーを押すか、フィールド外をクリックすると反映されます。
-        </p>
-        """, 
-        unsafe_allow_html=True
-    )
-    
-    is_valid_paid = (total_paid == st.session_state.amount_input) and (st.session_state.amount_input > 0)
-
-    if st.button("イベントを登録 💾", disabled=(not participants or not is_valid_paid), key="register_button", type="primary", use_container_width=True):
-        if is_valid_paid:
-            event_data = {
-                'event_name': st.session_state.event_name_input,
-                'amount': st.session_state.amount_input,
-                'currency': st.session_state.event_currency,
-                'participants': st.session_state.participants_select,
-                'paid_by': paid_by
-            }
-            
-            save_event(conn, GROUP_ID, event_data)
-            st.session_state.events.append(event_data)
-            st.session_state.paid_amounts = {}
-            st.success(f"イベント '{event_data['event_name']}' ({event_data['amount']:,.0f} {event_data['currency']}) を登録しました！")
-            st.rerun() 
-        else:
-            st.error(f"エラー: イベント合計金額と立て替え総額が {st.session_state.event_currency} で一致していないか、合計金額がゼロです。")
-            
-st.markdown("---")
-
-# 登録済みイベントの表示
-st.header("📖 登録済み支払いリスト")
-# ... (リスト表示コードは省略) ...
-if st.session_state.events:
-    for event in st.session_state.events:
-        currency_symbol = event['currency']
-        
-        rate_multiplier = 1.0 / EXCHANGE_RATES.get(currency_symbol, 1.0)
-        converted_amount = event['amount'] * rate_multiplier
-        
-        with st.expander(f"**{event['event_name']}** ({event['amount']:,.0f} {currency_symbol})", expanded=False):
-            st.markdown(f"**合計金額:** **{event['amount']:,.0f} {currency_symbol}** （現在のレートで**約 {converted_amount:,.0f} 円**）")
-            st.markdown(f"**参加者:** {', '.join(event['participants'])}")
-            paid_info = ", ".join([f"{p}: {a:,.0f}{currency_symbol}" for p, a in event['paid_by'].items() if a > 0])
-            st.markdown(f"**立替者:** {paid_info}")
-
-else:
-    st.info("まだ支払いイベントが登録されていません。")
-
-st.markdown("---")
-
-# 最終計算と結果表示
-st.header("✅ 精算結果")
-# ... (精算結果コードは省略) ...
-if st.session_state.events:
-    summary, payments = calculate_split(st.session_state.events, EXCHANGE_RATES)
-    
-    if summary is not None:
-        st.subheader("1. メンバーごとの収支")
-        st.info("すべてのイベントを現在のレートで円に換算して計算しています。")
-        
-        balance_list = []
-        for index, row in summary.iterrows():
-            person = row['person']
-            net_balance = round(row['net_balance'], 0)
-            total_paid = round(row['total_paid'], 0)
-            total_owed = round(row['total_owed'], 0) 
-            
-            if net_balance > 0:
-                status = f"**{person}** は {total_paid:,.0f} 円を立て替えました（負担すべき額は {total_owed:,.0f} 円）。" \
-                         f"**{net_balance:,.0f} 円** **多く払った**ため、返金を受ける必要があります。"
-            elif net_balance < 0:
-                status = f"**{person}** は {total_paid:,.0f} 円を立て替えましたが（負担すべき額は {total_owed:,.0f} 円）、" \
-                         f"**{abs(net_balance):,.0f} 円** **不足しています**（払う必要があります）。"
-            else:
-                status = f"**{person}** は立て替えと負担が一致しており、精算は不要です。"
-            
-            balance_list.append(status)
-        
-        st.markdown('\n'.join([f"- {item}" for item in balance_list]))
-
-        
-        st.subheader("2. 最小精算の提案")
-        
-        if payments:
-            payment_list = []
-            for payment in payments:
-                amount_text = f"{payment['amount']:,.0f} 円"
-                payment_list.append(f"**{payment['from']}** が **{payment['to']}** に **{amount_text}** を支払う")
-            
-            st.success("以下の送金で精算が完了します。")
-            st.markdown('\n'.join([f"- {item}" for item in payment_list]))
-        else:
-            st.info("精算は必要ありません。")
-    else:
-        st.error("有効なイベントデータがありません。")
-
-st.markdown("---")
-
-# リセットボタン
-if st.button(f"現在のグループ ({GROUP_ID}) のデータをリセット 🗑️", type="secondary", use_container_width=True):
-    c = conn.cursor()
-    c.execute("DELETE FROM events WHERE group_id = %s", (GROUP_ID,))
-    c.execute("DELETE FROM people WHERE group_id = %s", (GROUP_ID,))
-    c.execute("DELETE FROM settings WHERE group_id = %s", (GROUP_ID,))
-    conn.commit()
-    st.session_state.events = []
-    st.session_state.all_people = set()
-    st.success(f"グループID `{GROUP_ID}` の全てのデータがリセットされました。")
-    st.rerun()
-
-# 最後にDB接続を閉じる (Streamlitの再実行モデルではセッション終了時に自動で閉じる方が安全なため、ここではコメントアウト)
-# if 'conn' in locals() and conn is not None:
-#     try:
-#         conn.close()
-#     except:
-#         pass
+        st.info(f"合計金額 ({st.session_
