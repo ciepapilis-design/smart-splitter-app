@@ -1,5 +1,7 @@
+%%writefile app.py
 import streamlit as st
 import pandas as pd
+import sqlite3
 import json
 import os
 import requests
@@ -7,31 +9,29 @@ from datetime import datetime, timedelta
 import pytz 
 import psycopg2 
 import urllib.parse
+import hashlib # ★ 新規追加: グループIDのハッシュ化に使用
 
-# --- データベース/API設定 ---
+# --- データベース設定 ---
+DB_NAME = 'splitwise_data.db'
+
+# --- API設定とキャッシュ ---
 EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/JPY" 
 SUPPORTED_CURRENCIES = ["JPY", "USD", "EUR", "KRW", "TWD", "GBP", "AUD"] 
 JST = pytz.timezone('Asia/Tokyo')
 
 # --- DB接続関数 ---
 
-# ⚠️ 注意: Streamlit Cloudでデプロイする際、この関数はst.secrets['DATABASE_URL']を使います。
-# Google Colabでテストする際は、代わりにローカルのSQLiteを使用するか、
-# 環境変数DB_URLを設定する必要があります。
 def get_db_connection():
     """PostgreSQLデータベースに接続する (Streamlit Cloudのsecretsを優先)"""
     try:
-        # Streamlit Cloudのシークレットから接続情報を取得
         if 'DATABASE_URL' in st.secrets:
             db_url = st.secrets['DATABASE_URL']
-        # ローカル環境（Colabなど）から環境変数を取得
         elif 'DB_URL' in os.environ:
             db_url = os.environ['DB_URL']
         else:
             st.error("データベースURLが設定されていません。アプリを停止します。")
             st.stop()
             
-        # URLをパースして接続情報を作成
         parsed_url = urllib.parse.urlparse(db_url)
         conn = psycopg2.connect(
             host=parsed_url.hostname,
@@ -44,45 +44,6 @@ def get_db_connection():
     except Exception as e:
         st.error(f"データベース接続エラー: {e}")
         st.stop()
-
-
-def init_db(conn):
-    """データベースを初期化し、イベント、参加者、設定テーブルを作成する (group_idを追加)"""
-    c = conn.cursor()
-    
-    # イベントテーブル (group_idで分離)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS events (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT NOT NULL,
-            event_name TEXT NOT NULL,
-            amount REAL NOT NULL,
-            currency TEXT NOT NULL DEFAULT 'JPY',
-            participants TEXT NOT NULL,
-            paid_by TEXT NOT NULL
-        )
-    ''')
-    
-    # 参加者テーブル (group_idで分離)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS people (
-            id SERIAL PRIMARY KEY,
-            group_id TEXT NOT NULL,
-            person_name TEXT NOT NULL,
-            UNIQUE (group_id, person_name)
-        )
-    ''')
-    
-    # 設定テーブル (group_idで分離)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            group_id TEXT NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT,
-            PRIMARY KEY (group_id, key)
-        )
-    ''')
-    conn.commit()
 
 
 def save_setting(conn, group_id, key, value):
@@ -103,7 +64,7 @@ def load_setting(conn, group_id, key, default):
     return result[0] if result else default
 
 def save_event(conn, group_id, event_data):
-    """新しいイベントをデータベースに保存し、IDを返す"""
+    """新しいイベントをデータベースに保存する"""
     c = conn.cursor()
     participants_json = json.dumps(event_data['participants'])
     paid_by_json = json.dumps(event_data['paid_by'])
@@ -118,14 +79,12 @@ def save_person(conn, group_id, person_name):
     """新しい参加者をデータベースに保存する (グループ内で重複しない場合のみ)"""
     c = conn.cursor()
     try:
-        # ON CONFLICT DO NOTHING を使用して重複挿入を回避
         c.execute(
             "INSERT INTO people (group_id, person_name) VALUES (%s, %s) ON CONFLICT (group_id, person_name) DO NOTHING", 
             (group_id, person_name)
         )
         conn.commit()
     except Exception as e:
-        # データベースエラーが発生した場合の処理（ここでは無視）
         conn.rollback() 
         pass
 
@@ -158,9 +117,43 @@ def load_data(conn, group_id):
 
     return events, all_people
 
+def init_db(conn):
+    """データベースを初期化し、イベント、参加者、設定テーブルを作成する (group_idを追加)"""
+    c = conn.cursor()
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            id SERIAL PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'JPY',
+            participants TEXT NOT NULL,
+            paid_by TEXT NOT NULL
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS people (
+            id SERIAL PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            person_name TEXT NOT NULL,
+            UNIQUE (group_id, person_name)
+        )
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            group_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (group_id, key)
+        )
+    ''')
+    conn.commit()
+
 def get_exchange_rate():
     # (為替レート関数は変更なし)
-    """ExchangeRate-APIから最新の為替レートを取得し、キャッシュする"""
     now_utc = datetime.now(pytz.utc)
     now_jst = now_utc.astimezone(JST)
     
@@ -195,7 +188,6 @@ def get_exchange_rate():
 
 def calculate_split(data, rates):
     # (計算ロジック関数は変更なし)
-    """割り勘データを計算し、精算の提案を返す関数（外貨を円換算して処理）"""
     transactions = []
     
     for event in data:
@@ -276,25 +268,22 @@ st.set_page_config(
     menu_items={'About': 'Python学習で作られた割り勘アプリです。'},
     initial_sidebar_state="expanded"
 )
+st.title("💰 Smart Splitter (スマート割り勘計算機)")
 
 # 1. 団体IDの取得と設定
-query_params = st.experimental_get_query_params()
-# URLから 'group' パラメータを取得。なければ 'default' を使用。
-GROUP_ID = query_params.get("group", ["default"])[0] 
+# ★ 修正: st.experimental_get_query_params を st.query_params に置き換え
+query_params = st.query_params 
+GROUP_ID = query_params.get("group", "default")
 
 # 接続と初期化
 try:
     conn = get_db_connection()
     init_db(conn)
 except:
-    # 接続失敗時は処理を停止
     st.stop()
 
 
-# ページタイトル
-st.title("💰 Smart Splitter (スマート割り勘計算機)")
-st.subheader(f"現在参照中のグループID: **`{GROUP_ID}`**")
-st.info(f"このアプリは、URLに `?group=XXX` の形式でパラメータを付与することで、各団体専用のデータベースを参照します。")
+# --- アプリケーションのロジック ---
 
 # データをデータベースからロード
 loaded_events, loaded_people = load_data(conn, GROUP_ID)
@@ -311,14 +300,14 @@ if 'default_currency' not in st.session_state:
 EXCHANGE_RATES = get_exchange_rate()
 
 
-# サイドバーで参加者を追加 
+# --- サイドバー (メンバー管理/設定) ---
 with st.sidebar:
     st.header("👥 メンバー管理")
     
+    # ... (メンバー管理コードは省略) ...
     input_key = f"new_person_input"
     new_person = st.text_input("メンバー名", key=input_key)
     
-    # メンバー追加ボタンを secondary に変更
     if st.button("メンバーを追加 ➕", use_container_width=True, type="secondary"):
         person_to_add = st.session_state[input_key].strip()
         
@@ -326,7 +315,6 @@ with st.sidebar:
             save_person(conn, GROUP_ID, person_to_add) 
             st.session_state.all_people.add(person_to_add)
             st.success(f"'{person_to_add}' を追加しました！")
-            conn.close()
             st.rerun() 
         elif person_to_add:
             st.warning("その名前は既に追加されているか、空欄です。")
@@ -351,12 +339,10 @@ with st.sidebar:
         key='default_currency_select'
     )
     
-    # 変更を検知し、セッション状態とDBを更新してから RERUN を実行
     if st.session_state.default_currency != st.session_state.default_currency_select:
         new_currency = st.session_state.default_currency_select
         st.session_state.default_currency = new_currency
         save_setting(conn, GROUP_ID, 'default_currency', new_currency) # DBに永続化
-        conn.close()
         st.rerun() 
             
     st.markdown("---")
@@ -371,9 +357,49 @@ with st.sidebar:
             
     st.table(rate_table)
 
+# --- グループ作成・共有機能の追加 ---
+st.sidebar.markdown("---")
+st.sidebar.header("🔗 グループの共有")
+
+# ★ 新しいグループ名の入力
+new_group_name = st.sidebar.text_input("新しいグループ名を入力", key="new_group_name_input")
+
+if st.sidebar.button("グループを生成・共有", use_container_width=True, type="primary"):
+    if new_group_name:
+        # グループ名からユニークなIDを生成 (SHA256ハッシュの先頭8文字を使用)
+        # これにより、ユーザーが意図しないグループIDを使うのを防ぐ
+        unique_id = hashlib.sha256(new_group_name.encode()).hexdigest()[:8]
+        
+        # 現在のアプリのベースURLを取得し、新しいグループIDをクエリパラメータに追加
+        base_url = st.query_params.to_dict().get("base_url", [st.get_option("server.baseUrl") or ""])[0]
+        if not base_url and 'SERVER_BASE_URL' in os.environ:
+             base_url = os.environ['SERVER_BASE_URL']
+        
+        # Streamlit Cloud環境では、以下の形式でベースURLを構築
+        # デプロイ後にリンクが正常に機能するのを確認するため、仮のURLを構築
+        if st.get_option("server.enableCORS") and st.get_option("server.enableXsrfProtection"):
+             # 公開環境の場合、ホスト名に group=XXX を追加
+             current_url = f"https://{os.environ.get('HOSTNAME', 'your-app-url')}/?group={unique_id}"
+        else:
+             # Colab環境でのテスト用リンク
+             current_url = f"URLがデプロイ後に生成されます/?group={unique_id}"
+
+        # URLパラメータを操作して新しいリンクを構築
+        st.session_state.share_link = f"{st.get_option('server.baseUrl') or st.experimental_get_query_params().get('url_base', [''])[0].split('?')[0] or 'https://your-deployed-app.com/'}?group={unique_id}"
+
+        st.sidebar.success(f"グループ '{new_group_name}' が生成されました！")
+        
+        st.sidebar.markdown("##### 共有リンク")
+        st.sidebar.code(f"{st.get_option('server.baseUrl') or st.experimental_get_query_params().get('url_base', [''])[0].split('?')[0] or 'https://your-deployed-app.com/'}?group={unique_id}")
+    else:
+        st.sidebar.warning("グループ名を入力してください。")
+
+
+# --- メインコンテンツ ---
 
 # 新しい支払いイベントの追加フォーム
 with st.expander("📝 新しい支払い（立替）を記録する", expanded=True):
+    # ... (イベント登録フォームのコードは省略) ...
     col_name, col_amount, col_currency = st.columns([2, 1, 1])
     
     with col_name:
@@ -411,11 +437,9 @@ with st.expander("📝 新しい支払い（立替）を記録する", expanded=
         st.info(f"合計金額 ({st.session_state.event_currency}) になるよう、立て替え額を**整数**で入力してください。")
         for person in participants:
             def update_paid_amount(p=person):
-                # 入力された値がNoneでないことを確認
                 if st.session_state[f"paid_{p}"] is not None:
                     st.session_state.paid_amounts[p] = int(st.session_state[f"paid_{p}"]) 
 
-            # 初期値に None が入らないように処理
             initial_paid_amount = int(st.session_state.paid_amounts.get(person, 0))
             
             paid_amount = st.number_input(
@@ -427,7 +451,6 @@ with st.expander("📝 新しい支払い（立替）を記録する", expanded=
                 on_change=update_paid_amount,
                 format="%d"
             )
-            # 現在の値を paid_by に反映
             paid_by[person] = int(paid_amount)
             total_paid += int(paid_amount)
 
@@ -461,7 +484,6 @@ with st.expander("📝 新しい支払い（立替）を記録する", expanded=
             st.session_state.events.append(event_data)
             st.session_state.paid_amounts = {}
             st.success(f"イベント '{event_data['event_name']}' ({event_data['amount']:,.0f} {event_data['currency']}) を登録しました！")
-            conn.close()
             st.rerun() 
         else:
             st.error(f"エラー: イベント合計金額と立て替え総額が {st.session_state.event_currency} で一致していないか、合計金額がゼロです。")
@@ -470,6 +492,7 @@ st.markdown("---")
 
 # 登録済みイベントの表示
 st.header("📖 登録済み支払いリスト")
+# ... (リスト表示コードは省略) ...
 if st.session_state.events:
     for event in st.session_state.events:
         currency_symbol = event['currency']
@@ -484,12 +507,13 @@ if st.session_state.events:
             st.markdown(f"**立替者:** {paid_info}")
 
 else:
-    st.info("まだ支払いイベントが登録されていません。左側のフォームから追加してください。")
+    st.info("まだ支払いイベントが登録されていません。")
 
 st.markdown("---")
 
 # 最終計算と結果表示
 st.header("✅ 精算結果")
+# ... (精算結果コードは省略) ...
 if st.session_state.events:
     summary, payments = calculate_split(st.session_state.events, EXCHANGE_RATES)
     
@@ -504,7 +528,6 @@ if st.session_state.events:
             total_paid = round(row['total_paid'], 0)
             total_owed = round(row['total_owed'], 0) 
             
-            # 最終指示の文言を反映
             if net_balance > 0:
                 status = f"**{person}** は {total_paid:,.0f} 円を立て替えました（負担すべき額は {total_owed:,.0f} 円）。" \
                          f"**{net_balance:,.0f} 円** **多く払った**ため、返金を受ける必要があります。"
@@ -535,24 +558,22 @@ if st.session_state.events:
         st.error("有効なイベントデータがありません。")
 
 st.markdown("---")
+
 # リセットボタン
 if st.button(f"現在のグループ ({GROUP_ID}) のデータをリセット 🗑️", type="secondary", use_container_width=True):
     c = conn.cursor()
-    # 現在のグループIDに紐づくデータのみを削除
     c.execute("DELETE FROM events WHERE group_id = %s", (GROUP_ID,))
     c.execute("DELETE FROM people WHERE group_id = %s", (GROUP_ID,))
     c.execute("DELETE FROM settings WHERE group_id = %s", (GROUP_ID,))
     conn.commit()
-    conn.close()
-    
     st.session_state.events = []
     st.session_state.all_people = set()
     st.success(f"グループID `{GROUP_ID}` の全てのデータがリセットされました。")
     st.rerun()
 
-# 最後にDB接続を閉じる
-if 'conn' in locals() and conn is not None:
-    try:
-        conn.close()
-    except:
-        pass
+# 最後にDB接続を閉じる (Streamlitの再実行モデルではセッション終了時に自動で閉じる方が安全なため、ここではコメントアウト)
+# if 'conn' in locals() and conn is not None:
+#     try:
+#         conn.close()
+#     except:
+#         pass
